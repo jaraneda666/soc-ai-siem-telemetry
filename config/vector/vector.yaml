@@ -1,0 +1,139 @@
+data_dir: /var/lib/vector
+
+sources:
+  syslog_udp:
+    type: syslog
+    address: 0.0.0.0:514
+    mode: udp
+    max_length: 102400
+
+  syslog_tcp:
+    type: syslog
+    address: 0.0.0.0:514
+    mode: tcp
+    max_length: 102400
+
+transforms:
+  normalize_syslog:
+    type: remap
+    inputs:
+      - syslog_udp
+      - syslog_tcp
+    source: |
+      .source_type = "syslog"
+      .event_category = "system"
+      .is_security_alert = false
+      .target_port = 0
+      .source_ip = "0.0.0.0"
+
+      # Normalizar timestamp al instante de recepcion en el colector (UTC)
+      .device_timestamp = .timestamp
+      .timestamp = now()
+
+      msg = to_string(.message) ?? ""
+      msg_lower = downcase(msg)
+      host_val = to_string(.host) ?? to_string(.hostname) ?? "unknown"
+
+      # Clasificación de origen de host
+      if contains(host_val, "1Piso") || contains(host_val, "2Piso") || contains(host_val, "192.168.1.253") || contains(host_val, "192.168.1.254") || contains(host_val, "UniFi") {
+        .device_type = "unifi_ap"
+      } else if contains(host_val, "192.168.1.1") || contains(host_val, "Router_Casa") || contains(host_val, "OpenWrt") {
+        .device_type = "router_openwrt"
+      } else if contains(host_val, "192.168.1.100") || contains(host_val, "synology") {
+        .device_type = "nas_synology"
+      } else {
+        .device_type = "network_device"
+      }
+
+      # 1. Reglas de cortafuegos OpenWrt (descartes de tráfico WAN)
+      if contains(msg_lower, "reject wan in:") || contains(msg_lower, "drop wan in:") {
+        .event_category = "firewall_reject"
+        
+        # Extracción de campos clave
+        src_match = parse_regex(msg, r'SRC=(?P<src>[\d\.]+)') ?? {}
+        if exists(src_match.src) {
+          .source_ip = src_match.src
+        }
+        
+        dst_match = parse_regex(msg, r'DST=(?P<dst>[\d\.]+)') ?? {}
+        if exists(dst_match.dst) {
+          .dest_ip = dst_match.dst
+        }
+
+        dpt_match = parse_regex(msg, r'DPT=(?P<dpt>\d+)') ?? {}
+        if exists(dpt_match.dpt) {
+          .target_port = to_int(dpt_match.dpt) ?? 0
+        }
+
+        proto_match = parse_regex(msg, r'PROTO=(?P<proto>\w+)') ?? {}
+        if exists(proto_match.proto) {
+          .protocol = proto_match.proto
+        }
+
+        # Detección de puertos sensibles (posible escaneo o ataque dirigido)
+        sensitive_ports = [21, 22, 23, 25, 80, 443, 445, 1433, 3306, 3389, 5000, 5001, 8080, 8096]
+        if includes(sensitive_ports, .target_port) {
+          .is_security_alert = true
+          .alert_reason = "Bloqueo de conexión WAN en puerto crítico"
+        }
+      }
+
+      # 2. Detección de intentos de acceso SSH por fuerza bruta
+      app_val = to_string(.appname) ?? ""
+      app_lower = downcase(app_val)
+      if (contains(msg_lower, "dropbear") || contains(app_lower, "dropbear")) && (contains(msg_lower, "bad password") || contains(msg_lower, "login attempt")) {
+        .event_category = "auth_failure"
+        .is_security_alert = true
+        .alert_reason = "Fallo de autenticación SSH Dropbear"
+        .target_port = 22
+        
+        src_match = parse_regex(msg, r'from\s+(?P<src>[\d\.]+)') ?? {}
+        if exists(src_match.src) {
+          .source_ip = src_match.src
+        }
+      }
+
+      # 3. Detección de accesos denegados en Nginx / Web
+      if contains(msg_lower, " 403 ") || contains(msg_lower, "access denied") {
+        .event_category = "web_access_denied"
+        .is_security_alert = true
+        .alert_reason = "Petición HTTP bloqueada por regla ACL / 403"
+      }
+
+  filter_alerts_only:
+    type: filter
+    inputs:
+      - normalize_syslog
+    condition: ".is_security_alert == true"
+
+sinks:
+  sink_loki:
+    type: loki
+    inputs:
+      - normalize_syslog
+    endpoint: http://loki:3100
+    out_of_order_action: accept
+    healthcheck:
+      enabled: false
+    encoding:
+      codec: json
+    labels:
+      source_type: "{{ source_type }}"
+      device_type: "{{ device_type }}"
+      event_category: "{{ event_category }}"
+      is_alert: "{{ is_security_alert }}"
+
+  sink_ai_connector:
+    type: http
+    inputs:
+      - filter_alerts_only
+    uri: http://soc_ai_connector:8088/alert
+    method: post
+    healthcheck:
+      enabled: false
+    encoding:
+      codec: json
+    batch:
+      max_events: 5
+      timeout_secs: 2
+

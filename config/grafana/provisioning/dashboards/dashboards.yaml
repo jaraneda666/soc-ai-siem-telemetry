@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: 'Soc_AI Dashboards'
+    orgId: 1
+    folder: 'Ciberseguridad'
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /etc/grafana/provisioning/dashboards

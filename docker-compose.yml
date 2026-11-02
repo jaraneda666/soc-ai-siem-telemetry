@@ -1,0 +1,100 @@
+version: '3.8'
+
+services:
+  vector:
+    image: timberio/vector:0.38.0-alpine
+    container_name: soc_vector
+    restart: unless-stopped
+    ports:
+      - "514:514/udp"
+      - "514:514/tcp"
+      - "8686:8686"
+    volumes:
+      - ./config/vector/vector.yaml:/etc/vector/vector.yaml:ro
+      - vector_data:/var/lib/vector
+    environment:
+      - VECTOR_LOG=warn
+    mem_limit: 128m
+    networks:
+      - soc_net
+
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: soc_loki
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/loki-config.yaml
+    volumes:
+      - ./config/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki_data:/loki
+    mem_limit: 256m
+    networks:
+      - soc_net
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: soc_grafana
+    restart: unless-stopped
+    ports:
+      - "3003:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SECURITY_DISABLE_GRAVATAR=true
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - loki
+    mem_limit: 192m
+    networks:
+      - soc_net
+      - speedtest_default
+
+  soc_ai_connector:
+    image: python:3.11-alpine
+    container_name: soc_ai_connector
+    restart: unless-stopped
+    ports:
+      - "8089:8088"
+    environment:
+      - OLLAMA_ENDPOINT=http://127.0.0.1:11434/api/generate
+      - OLLAMA_MODEL=qwen2.5-coder:7b
+      - LOKI_ENDPOINT=http://loki:3100/loki/api/v1/push
+      - TELEGRAM_BOT_TOKEN=
+      - TELEGRAM_CHAT_ID=
+      - LOG_LEVEL=INFO
+      - OPENWRT_HOST=192.168.1.1
+      - OPENWRT_USER=root
+      - OPENWRT_KEY_PATH=/app/ssh/id_ed25519
+      - BAN_TIMEOUT=1h
+    volumes:
+      - ./tools/conector_ia_soc.py:/app/conector_ia_soc.py:ro
+      - ./config/ssh:/app/ssh:ro
+    working_dir: /app
+    command: sh -c "pip install --no-cache-dir requests urllib3 paramiko && python conector_ia_soc.py"
+    depends_on:
+      - vector
+    mem_limit: 128m
+    networks:
+      - soc_net
+
+networks:
+  soc_net:
+    name: soc_net
+    driver: bridge
+  speedtest_default:
+    name: speedtest_default
+    external: true
+
+volumes:
+  vector_data:
+    name: soc_vector_data
+  loki_data:
+    name: soc_loki_data
+  grafana_data:
+    name: soc_grafana_data
